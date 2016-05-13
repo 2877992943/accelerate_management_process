@@ -1,0 +1,303 @@
+#!/usr/bin/env python
+# encoding=utf-8
+
+
+
+
+import pandas as pd
+import numpy as np
+import xgboost as xgb
+from scipy.optimize import fmin_powell
+from ml_metrics import quadratic_weighted_kappa
+import cPickle,time
+import pylab as plt
+import theano,lasagne
+import theano.tensor as T
+
+dataPath='/home/yr/accelerate-management-process/' 
+
+
+
+
+def eval_wrapper(yhat, y):  
+    y = np.array(y);print y[:10]
+    y = y.astype(int);print yhat[:10]
+    #yhat = np.array(yhat)
+    #yhat = np.clip(np.round(yhat), np.min(y), np.max(y)).astype(int)  
+    err=np.sum((y-yhat)*(y-yhat))/float(y.shape[0])
+    #return quadratic_weighted_kappa(yhat, y)
+    return err
+
+def save2pickle(c,name):
+    write_file=open(dataPath+str(name),'wb')
+    cPickle.dump(c,write_file,-1)#[ (timestamp,[motion,x,y,z]),...]
+    write_file.close()
+ 
+def load_pickle(path_i):
+    f=open(path_i,'rb')
+    data=cPickle.load(f)#[ [time,[xyz],y] ,[],[]...]
+    f.close()
+    #print data.__len__(),data[0]
+    return data	
+
+ 
+
+
+def build_mlp(input_var=None):
+  
+    l_in = lasagne.layers.InputLayer(shape=(None, 1, dim1, dim2),
+                                     input_var=input_var)
+    """
+    ####
+    l_hid = lasagne.layers.DenseLayer(
+            l_in, num_units=num_hid_node,
+            nonlinearity=lasagne.nonlinearities.rectify,
+            W=lasagne.init.GlorotUniform())
+    ####
+
+    l_hid2 = lasagne.layers.DenseLayer(
+            l_hid, num_units=num_hid_node,
+            nonlinearity=lasagne.nonlinearities.rectify,
+            W=lasagne.init.GlorotUniform())
+
+    """
+    ####cnn pool
+
+     
+    l_cnn=lasagne.layers.Conv2DLayer(
+		l_in,num_filters=64,filter_size=(3,3),
+		nonlinearity=lasagne.nonlinearities.rectify,
+		W=lasagne.init.GlorotUniform())
+    #l_maxpool=lasagne.layers.MaxPool2DLayer(l_cnn,pool_size=(2,2))
+     
+ 
+     
+    l_dens = lasagne.layers.DenseLayer(
+            lasagne.layers.dropout(l_cnn,p=.5), 
+	    num_units=32,
+            nonlinearity=lasagne.nonlinearities.rectify)
+     
+
+    
+    l_out=lasagne.layers.DenseLayer(
+		lasagne.layers.dropout(l_cnn,p=.5),
+		num_units=2,
+		nonlinearity=lasagne.nonlinearities.softmax)
+    
+
+    return l_out
+
+
+def iterate_minibatches(inputs, targets, batchsize, shuffle=False):
+    
+    assert len(inputs) == len(targets)
+    if shuffle:
+        indices = np.arange(len(inputs))
+        np.random.shuffle(indices)
+    for start_idx in range(0, len(inputs) - batchsize + 1, batchsize):
+        if shuffle:
+            excerpt = indices[start_idx:start_idx + batchsize]
+        else:
+            excerpt = slice(start_idx, start_idx + batchsize)
+        yield inputs[excerpt], targets[excerpt]
+
+
+# ############################## Main program ###############################
+def main(loaded,model, num_epochs):
+    # Load the dataset
+    print("Loading data...")
+    X_train, y_train, X_val, y_val, X_test, y_test = loaded
+
+    # Prepare Theano variables for inputs and targets
+    input_var = T.tensor4('inputs')
+    target_var = T.ivector('targets')
+
+    # Create neural network model (depending on first command line parameter)
+    print("Building model and compiling functions...")
+    if model == 'mlp':
+        network = build_mlp(input_var)
+    else:
+        print("Unrecognized model type %r." % model)
+
+    prediction = lasagne.layers.get_output(network)
+    loss = lasagne.objectives.categorical_crossentropy(prediction, target_var)
+    loss = loss.mean()
+   
+    params = lasagne.layers.get_all_params(network, trainable=True)
+    updates = lasagne.updates.nesterov_momentum(
+            loss, params, learning_rate=0.01, momentum=0.9)
+
+  
+    test_prediction = lasagne.layers.get_output(network, deterministic=True)
+    test_loss = lasagne.objectives.categorical_crossentropy(test_prediction,
+                                                            target_var)
+    test_loss = test_loss.mean()
+ 
+    test_acc = T.mean(T.eq(T.argmax(test_prediction, axis=1), target_var),
+                      dtype=theano.config.floatX)
+
+
+    train_fn = theano.function([input_var, target_var], loss, updates=updates)
+
+    val_fn = theano.function([input_var, target_var], [test_loss, test_acc])
+
+    # Finally, launch the training loop.
+    print("Starting training...")
+    # We iterate over epochs:
+    for epoch in range(num_epochs):
+        # In each epoch, we do a full pass over the training data:
+        train_err = 0
+        train_batches = 0
+        start_time = time.time()
+        for batch in iterate_minibatches(X_train, y_train, batch_sz, shuffle=True):
+            inputs, targets = batch
+            train_err += train_fn(inputs, targets)
+            train_batches += 1
+
+        # And a full pass over the validation data:
+        val_err = 0
+        val_acc = 0
+        val_batches = 0
+        for batch in iterate_minibatches(X_val, y_val, batch_sz, shuffle=False):
+            inputs, targets = batch; 
+            err, acc = val_fn(inputs, targets)
+            val_err += err
+            val_acc += acc
+            val_batches += 1; 
+
+	 
+        # Then we print the results for this epoch:
+        print("Epoch {} of {} took {:.3f}s".format(
+            epoch + 1, num_epochs, time.time() - start_time))
+        print("  training loss:\t\t{:.6f}".format(train_err / train_batches))
+        print("  validation loss:\t\t{:.6f}".format(val_err / val_batches))
+        print("  validation accuracy:\t\t{:.2f} %".format(
+            val_acc / val_batches * 100))
+
+    # After training, we compute and print the test error:
+    test_err = 0
+    test_acc = 0
+    test_batches = 0
+    for batch in iterate_minibatches(X_test, y_test, batch_sz, shuffle=False):
+        inputs, targets = batch
+        err, acc = val_fn(inputs, targets)
+        test_err += err
+        test_acc += acc
+        test_batches += 1
+    print("Final results:")
+    print("  test loss:\t\t\t{:.6f}".format(test_err / test_batches))
+    print("  test accuracy:\t\t{:.2f} %".format(
+        test_acc / test_batches * 100))
+
+    para_value_c=lasagne.layers.get_all_param_values(network)
+    save2pickle(para_value_c,'wb_para')
+
+
+if __name__=='__main__':
+	# XGBoost params:
+	
+	"""
+	print('Load data...')
+	train = pd.read_csv("../input/train.csv")
+	target = train['target']
+	train = train.drop(['ID','target'],axis=1)
+	test = pd.read_csv("../input/test.csv")
+	ids = test['ID'].values
+	test = test.drop(['ID'],axis=1)
+	#
+	print('Clearing...')
+	for (train_name, train_series), (test_name, test_series) in zip(train.iteritems(),test.iteritems())[:]:
+	    # each columns
+	    
+	    if train_series.dtype == 'O':
+		#for objects: factorize
+		train[train_name], tmp_indexer = pd.factorize(train[train_name])
+		test[test_name] = tmp_indexer.get_indexer(test[test_name])
+		 
+		#but now we have -1 values (NaN)
+	    else:
+		#for int or float: fill NaN
+		tmp_len = len(train[train_series.isnull()]); 
+		if tmp_len>0:
+		    train.loc[train_series.isnull(), train_name] = train_series.mean()
+		#and Test
+		tmp_len = len(test[test_series.isnull()])
+		if tmp_len>0:
+		    test.loc[test_series.isnull(), test_name] = train_series.mean()  #TODO
+
+
+	save2pickle([train.values,target.values],'trainXY')
+	"""
+
+
+
+	 
+	trainx,trainy=load_pickle(dataPath+'trainXY')
+	#pad [n,131]->[n,144]
+	pad=np.zeros((trainx.shape[0],144-trainx.shape[1]))#[n,13]
+	trainx=np.concatenate((trainx,pad),axis=1)
+	##############nn
+	#
+	print 'nn...',trainx.shape,trainy.shape
+	epochN=3
+	#dim1,dim2=[1,trainx.shape[1]]
+	dim1,dim2=[12,12]
+	num_hid_node=50
+	batch_sz=100
+	#
+	X_train = trainx.reshape((-1, 1, dim1, dim2))
+	X_val=X_train;X_test=X_train
+	# The targets are int64, we cast them to int8 for GPU compatibility.
+    	y_train = trainy.astype(np.uint8)
+	y_val=y_train;y_test=y_train
+	loaded=[X_train, y_train, X_val, y_val, X_test, y_test]
+	
+	main(loaded,'mlp',epochN)
+	 
+	 
+
+	
+####
+nn cnn 0.76  far less than xgboost 0.87
+
+
+
+	
+	 
+	
+
+	
+	
+	  
+		
+		
+	
+	
+	
+
+ 	
+ 
+
+	 
+
+
+
+
+	 
+
+	 
+	 
+	 
+
+
+ 	
+		
+    
+ 
+	
+		
+	
+   		 
+
+
+
